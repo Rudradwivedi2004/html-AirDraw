@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AirDraw</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <style>
+    body { margin: 0; background: #050301; overflow: hidden; }
+    video { display: none; }
+    canvas { width: 100%; height: 100%; transform: scaleX(-1); position: absolute; z-index: 1; }
+    #cfx { z-index: 2; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <video id="vid"></video>
+  <canvas id="c"></canvas>
+  <canvas id="cfx"></canvas>
+  <script>
+   
+    var vid = document.getElementById('vid');
+    var c   = document.getElementById('c');
+    var ctx = c.getContext('2d');
+    var arr = [];
+    var cur = [];
+    var shift = false;
+    var draw  = false;
+    var sx = null, sy = null;
+
+    window.onkeydown = function(e) {
+      if (e.key == 'Shift') shift = true;
+      if (e.code == 'Space') arr = [];
+    };
+    window.onkeyup = function(e) {
+      if (e.key == 'Shift') shift = false;
+    };
+
+   
+    var cfx  = document.getElementById('cfx');
+    var fctx = cfx.getContext('2d');
+
+   
+    var lx_raw = null, ly_raw = null;
+   
+    var lx = null, ly = null;
+   
+    var lx_p = 0, ly_p = 0;
+    
+    var cosmicAlpha = 0;
+    var cosmicT = 0;
+
+  
+    var plasma  = [];
+    var nebulae = [];
+    var rings   = [];
+    var bursts  = [];
+    var trail   = [];
+
+    function mkPlasma(x, y, vxb, vyb) {
+      var a = Math.random() * Math.PI * 2;
+      var s = 0.5 + Math.random() * 3.5;
+      return {
+        x: x, y: y,
+        vx: Math.cos(a)*s + vxb*0.25,
+        vy: Math.sin(a)*s + vyb*0.25,
+        vz: (Math.random()-0.5)*2,
+        z: Math.random()*100-50,
+        size: 3+Math.random()*9,
+        hue: 170+Math.random()*170,
+        spin: (Math.random()-0.5)*0.1,
+        angle: Math.random()*Math.PI*2,
+        life: 1, decay: 0.005+Math.random()*0.011,
+        type: Math.floor(Math.random()*4)
+      };
+    }
+    function mkNebula(x, y) {
+      return {
+        x:x, y:y, r:50+Math.random()*100,
+        hue:220+Math.random()*140,
+        vx:(Math.random()-0.5)*0.8, vy:(Math.random()-0.5)*0.8-0.25,
+        phase:Math.random()*Math.PI*2, spd:0.015+Math.random()*0.025,
+        life:1, decay:0.002+Math.random()*0.004
+      };
+    }
+    function mkRing(x, y) {
+      return {
+        cx:x, cy:y,
+        rx:30+Math.random()*90, ry:8+Math.random()*35,
+        tilt:Math.random()*Math.PI, rot:Math.random()*Math.PI*2,
+        speed:0.016+Math.random()*0.038,
+        dotAngle:0, dots:3+Math.floor(Math.random()*6),
+        hue:170+Math.random()*180,
+        life:1, decay:0.003+Math.random()*0.005
+      };
+    }
+    function mkBurst(x, y) {
+      return {
+        x:x, y:y, rays:8+Math.floor(Math.random()*10),
+        maxR:40+Math.random()*110, r:0, speed:2+Math.random()*4.5,
+        hue:Math.random()*360, rot:Math.random()*Math.PI*2,
+        rotSpd:(Math.random()-0.5)*0.07,
+        life:1, decay:0.016+Math.random()*0.016
+      };
+    }
+
+    function spawnCosmic(x, y, vx, vy, intensity) {
+      var n = Math.floor(2 + intensity*5);
+      for (var i=0; i<n; i++) plasma.push(mkPlasma(x, y, vx, vy));
+      if (Math.random()<0.055) nebulae.push(mkNebula(x, y));
+      if (Math.random()<0.028) rings.push(mkRing(x, y));
+      if (Math.random()<0.038) bursts.push(mkBurst(x, y));
+    }
+
+    // ── RAF loop ───────────────────────────────────────────────────────────────
+    function rafLoop() {
+      requestAnimationFrame(rafLoop);
+      cosmicT++;
+      var W = cfx.width = c.width;
+      var H = cfx.height = c.height;
+
+      // smooth left hand position
+      var lvx = 0, lvy = 0;
+      var leftPresent = (lx_raw !== null);
+      if (leftPresent) {
+        if (lx === null) { lx = lx_raw; ly = ly_raw; }
+        else {
+          lx_p = lx; ly_p = ly;
+          lx += (lx_raw - lx) * 0.15;
+          ly += (ly_raw - ly) * 0.15;
+          lvx = lx - lx_p;
+          lvy = ly - ly_p;
+        }
+      } else {
+        lx = null; ly = null;
+      }
+
+      // fade cosmicAlpha in/out smoothly
+      var targetAlpha = leftPresent ? 1 : 0;
+      cosmicAlpha += (targetAlpha - cosmicAlpha) * 0.06;
+
+      // if essentially invisible, just clear and skip
+      if (cosmicAlpha < 0.01) {
+        fctx.clearRect(0, 0, W, H);
+        // purge stale particles when hand gone
+        plasma=[]; nebulae=[]; rings=[]; bursts=[]; trail=[];
+        return;
+      }
+
+      // spawn particles while hand present
+      if (leftPresent && lx !== null) {
+        var spd = Math.sqrt(lvx*lvx + lvy*lvy);
+        var intensity = Math.min(spd/7, 1);
+        spawnCosmic(lx, ly, lvx, lvy, Math.max(intensity, 0.28));
+        trail.push({x:lx, y:ly, t:cosmicT});
+        if (trail.length > 130) trail.shift();
+      }
+
+      // soft ghost (motion blur feel)
+      fctx.save();
+      fctx.globalAlpha = cosmicAlpha;
+      fctx.fillStyle = 'rgba(5,3,1,0.15)';
+      fctx.fillRect(0, 0, W, H);
+      fctx.restore();
+
+      // ── trail ──────────────────────────────────────────────────────────────
+      if (trail.length > 2) {
+        fctx.save();
+        fctx.lineCap = 'round';
+        fctx.globalAlpha = cosmicAlpha;
+        for (var ti=1; ti<trail.length; ti++) {
+          var age = (cosmicT - trail[ti].t)/100;
+          if (age > 1) continue;
+          var ta = (1-age)*0.8;
+          var th = (trail[ti].t*2.8)%360;
+          var p0 = trail[Math.max(ti-1,0)];
+          var p1 = trail[ti];
+          var p2 = trail[Math.min(ti+1,trail.length-1)];
+          var cp1x = p0.x+(p1.x-p0.x)*0.5, cp1y = p0.y+(p1.y-p0.y)*0.5;
+          var cp2x = p1.x+(p2.x-p1.x)*0.5, cp2y = p1.y+(p2.y-p1.y)*0.5;
+          fctx.beginPath();
+          fctx.moveTo(cp1x, cp1y);
+          fctx.quadraticCurveTo(p1.x, p1.y, cp2x, cp2y);
+          fctx.strokeStyle = `hsla(${th},100%,72%,${ta})`;
+          fctx.lineWidth = 6*(1-age);
+          fctx.shadowColor = `hsl(${th},100%,60%)`;
+          fctx.shadowBlur = 14;
+          fctx.stroke();
+        }
+        fctx.restore();
+      }
+
+      // ── nebulae ────────────────────────────────────────────────────────────
+      for (var ni=nebulae.length-1; ni>=0; ni--) {
+        var nb=nebulae[ni];
+        nb.x+=nb.vx; nb.y+=nb.vy; nb.r+=0.35; nb.life-=nb.decay;
+        if (nb.life<=0){nebulae.splice(ni,1);continue;}
+        var nh=nb.hue+Math.sin(cosmicT*nb.spd+nb.phase)*25;
+        var ng=fctx.createRadialGradient(nb.x,nb.y,0,nb.x,nb.y,nb.r);
+        ng.addColorStop(0,`hsla(${nh},80%,60%,${0.26*nb.life})`);
+        ng.addColorStop(0.5,`hsla(${nh+40},70%,40%,${0.11*nb.life})`);
+        ng.addColorStop(1,'transparent');
+        fctx.save();
+        fctx.globalAlpha = nb.life * cosmicAlpha;
+        fctx.shadowColor=`hsl(${nh},100%,55%)`; fctx.shadowBlur=28;
+        fctx.beginPath(); fctx.arc(nb.x,nb.y,nb.r,0,Math.PI*2);
+        fctx.fillStyle=ng; fctx.fill();
+        fctx.restore();
+      }
+
+      // ── orbit rings ────────────────────────────────────────────────────────
+      for (var ri=rings.length-1; ri>=0; ri--) {
+        var rg=rings[ri];
+        rg.rot+=rg.speed; rg.dotAngle+=rg.speed*1.4; rg.life-=rg.decay;
+        if (rg.life<=0){rings.splice(ri,1);continue;}
+        fctx.save();
+        fctx.globalAlpha=rg.life*0.82*cosmicAlpha;
+        fctx.translate(rg.cx,rg.cy); fctx.rotate(rg.tilt);
+        fctx.shadowColor=`hsl(${rg.hue},100%,70%)`; fctx.shadowBlur=12;
+        fctx.beginPath(); fctx.ellipse(0,0,rg.rx,rg.ry,rg.rot,0,Math.PI*2);
+        fctx.strokeStyle=`hsla(${rg.hue},100%,70%,${0.42*rg.life})`;
+        fctx.lineWidth=1.5; fctx.stroke();
+        for (var di=0;di<rg.dots;di++){
+          var da=rg.dotAngle+(di/rg.dots)*Math.PI*2;
+          fctx.beginPath();
+          fctx.arc(Math.cos(da)*rg.rx,Math.sin(da)*rg.ry,3.5,0,Math.PI*2);
+          fctx.fillStyle=`hsl(${rg.hue+di*28},100%,82%)`;
+          fctx.shadowBlur=16; fctx.fill();
+        }
+        fctx.restore();
+      }
+
+      // ── star bursts ────────────────────────────────────────────────────────
+      for (var bi=bursts.length-1; bi>=0; bi--) {
+        var bst=bursts[bi];
+        bst.r+=bst.speed; bst.rot+=bst.rotSpd;
+        if (bst.r>=bst.maxR) bst.life-=bst.decay;
+        if (bst.life<=0){bursts.splice(bi,1);continue;}
+        var ba=Math.max(bst.life*(1-bst.r/bst.maxR*0.45),0)*cosmicAlpha;
+        fctx.save(); fctx.globalAlpha=ba;
+        fctx.translate(bst.x,bst.y); fctx.rotate(bst.rot);
+        fctx.shadowColor=`hsl(${bst.hue},100%,70%)`; fctx.shadowBlur=18;
+        fctx.lineWidth=Math.max(2-bst.r/bst.maxR*1.5,0.3); fctx.lineCap='round';
+        for (var rai=0;rai<bst.rays;rai++){
+          var ra=(rai/bst.rays)*Math.PI*2;
+          fctx.beginPath(); fctx.moveTo(0,0);
+          fctx.lineTo(Math.cos(ra)*bst.r,Math.sin(ra)*bst.r);
+          fctx.strokeStyle=`hsl(${bst.hue+rai*13},100%,72%)`;
+          fctx.stroke();
+        }
+        fctx.restore();
+      }
+
+      // ── plasma particles ───────────────────────────────────────────────────
+      for (var pi=plasma.length-1; pi>=0; pi--) {
+        var p=plasma[pi];
+        p.vx+=Math.sin(cosmicT*0.038+p.y*0.007)*0.13;
+        p.vy+=Math.cos(cosmicT*0.038+p.x*0.007)*0.07;
+        p.vx*=0.972; p.vy*=0.972;
+        p.x+=p.vx; p.y+=p.vy; p.z+=p.vz; p.angle+=p.spin;
+        p.life-=p.decay;
+        if (p.life<=0){plasma.splice(pi,1);continue;}
+        var fov=320, pz=p.z+320;
+        var sc=fov/Math.max(pz,10);
+        var px=p.x*sc+(1-sc)*W/2;
+        var py=p.y*sc+(1-sc)*H/2;
+        var sz=p.size*sc*p.life;
+        if (sz<0.3) continue;
+        fctx.save();
+        fctx.globalAlpha=p.life*0.86*cosmicAlpha;
+        fctx.translate(px,py); fctx.rotate(p.angle);
+        fctx.shadowColor=`hsl(${p.hue},100%,70%)`; fctx.shadowBlur=20;
+        var gr=fctx.createRadialGradient(0,0,0,0,0,sz*2.2);
+        gr.addColorStop(0,`hsla(${p.hue},100%,92%,1)`);
+        gr.addColorStop(0.35,`hsla(${p.hue+25},100%,65%,0.78)`);
+        gr.addColorStop(1,`hsla(${p.hue+55},100%,40%,0)`);
+        if (p.type===0){
+          fctx.beginPath(); fctx.arc(0,0,sz,0,Math.PI*2);
+          fctx.fillStyle=gr; fctx.fill();
+        } else if (p.type===1){
+          fctx.strokeStyle=`hsla(${p.hue},100%,72%,${p.life})`;
+          fctx.lineWidth=1.5;
+          fctx.beginPath(); fctx.arc(0,0,sz,0,Math.PI*2); fctx.stroke();
+          fctx.beginPath(); fctx.arc(0,0,sz*0.45,0,Math.PI*2); fctx.stroke();
+        } else if (p.type===2){
+          fctx.beginPath();
+          for (var si=0;si<8;si++){
+            var a2=(si/8)*Math.PI*2;
+            var rr=si%2===0?sz:sz*0.35;
+            si===0?fctx.moveTo(Math.cos(a2)*rr,Math.sin(a2)*rr):fctx.lineTo(Math.cos(a2)*rr,Math.sin(a2)*rr);
+          }
+          fctx.closePath(); fctx.fillStyle=gr; fctx.fill();
+        } else {
+          fctx.beginPath();
+          fctx.moveTo(0,-sz); fctx.lineTo(sz*0.45,0);
+          fctx.lineTo(0,sz); fctx.lineTo(-sz*0.45,0);
+          fctx.closePath(); fctx.fillStyle=gr; fctx.fill();
+        }
+        fctx.restore();
+      }
+
+      // ── aura rings around fingertip ────────────────────────────────────────
+      if (lx !== null) {
+        for (var ri2=0;ri2<6;ri2++){
+          var rph=(ri2/6)*Math.PI*2;
+          var rr2=18+ri2*20+Math.sin(cosmicT*0.055+rph)*10;
+          var rh=(cosmicT*3.5+ri2*45)%360;
+          fctx.save();
+          fctx.globalAlpha=(0.52-ri2*0.07)*cosmicAlpha;
+          fctx.beginPath(); fctx.arc(lx,ly,rr2,0,Math.PI*2);
+          fctx.strokeStyle=`hsla(${rh},100%,72%,1)`;
+          fctx.lineWidth=2-ri2*0.18;
+          fctx.shadowColor=`hsl(${rh},100%,60%)`; fctx.shadowBlur=22;
+          fctx.stroke(); fctx.restore();
+        }
+        var cg=fctx.createRadialGradient(lx,ly,0,lx,ly,40);
+        cg.addColorStop(0,'rgba(255,255,255,0.95)');
+        cg.addColorStop(0.25,`hsla(${cosmicT*4%360},100%,75%,0.78)`);
+        cg.addColorStop(1,'transparent');
+        fctx.save(); fctx.globalAlpha=cosmicAlpha;
+        fctx.beginPath(); fctx.arc(lx,ly,40,0,Math.PI*2);
+        fctx.fillStyle=cg; fctx.fill();
+        fctx.restore();
+      }
+    }
+    requestAnimationFrame(rafLoop);
+
+    // ── original run() — untouched logic, just added left-hand detection ──────
+    function run(res) {
+      c.width = window.innerWidth;
+      c.height = window.innerHeight;
+      ctx.drawImage(res.image, 0, 0, c.width, c.height);
+      ctx.fillStyle = 'rgba(10, 6, 2, 0.85)';
+      ctx.fillRect(0, 0, c.width, c.height);
+      ctx.shadowColor = '#F5D061';
+      ctx.shadowBlur = 15;
+      ctx.strokeStyle = '#F5D061';
+      ctx.lineWidth = 6;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (var i = 0; i < arr.length; i++) {
+        ctx.beginPath();
+        for (var j = 0; j < arr[i].length; j++) {
+          if (j == 0) ctx.moveTo(arr[i][j].x, arr[i][j].y);
+          else ctx.lineTo(arr[i][j].x, arr[i][j].y);
+        }
+        ctx.stroke();
+      }
+
+      // reset left hand raw each frame
+      lx_raw = null; ly_raw = null;
+
+      if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
+        for (var hi=0; hi<res.multiHandLandmarks.length; hi++) {
+          var lm = res.multiHandLandmarks[hi];
+          var label = (res.multiHandedness && res.multiHandedness[hi]) ? res.multiHandedness[hi].label : 'Right';
+
+          drawConnectors(ctx, lm, HAND_CONNECTIONS, {color: 'rgba(245, 208, 97, 0.3)', lineWidth: 2});
+          drawLandmarks(ctx, lm, {color: '#FFFFFF', lineWidth: 1, radius: 2});
+
+          if (label === 'Left') {
+            // mirrored canvas → 'Left' label = user's right hand (pen hand)
+            var ind = lm[8];
+            var rx = ind.x * c.width;
+            var ry = ind.y * c.height;
+            if (sx == null) { sx = rx; sy = ry; }
+            else { sx += (rx - sx) * 0.45; sy += (ry - sy) * 0.45; }
+            ctx.beginPath();
+            ctx.arc(sx, sy, 6, 0, 2 * Math.PI);
+            ctx.fillStyle = shift ? '#FFFFFF' : 'rgba(245, 208, 97, 0.4)';
+            ctx.fill();
+            if (shift) {
+              if (!draw) { draw = true; cur = []; arr.push(cur); }
+              cur.push({x: sx, y: sy});
+            } else { draw = false; }
+
+          } else {
+            // 'Right' label = user's left hand → cosmic
+            lx_raw = lm[8].x * c.width;
+            ly_raw = lm[8].y * c.height;
+          }
+        }
+
+        // fallback: single hand, no handedness info → treat as pen hand (original behaviour)
+        if (res.multiHandLandmarks.length === 1 && (!res.multiHandedness || !res.multiHandedness[0])) {
+          lx_raw = null; ly_raw = null;
+          var lm0 = res.multiHandLandmarks[0];
+          var ind0 = lm0[8];
+          var rx0 = ind0.x * c.width;
+          var ry0 = ind0.y * c.height;
+          if (sx == null) { sx = rx0; sy = ry0; }
+          else { sx += (rx0 - sx) * 0.45; sy += (ry0 - sy) * 0.45; }
+          ctx.beginPath();
+          ctx.arc(sx, sy, 6, 0, 2 * Math.PI);
+          ctx.fillStyle = shift ? '#FFFFFF' : 'rgba(245, 208, 97, 0.4)';
+          ctx.fill();
+          if (shift) {
+            if (!draw) { draw = true; cur = []; arr.push(cur); }
+            cur.push({x: sx, y: sy});
+          } else { draw = false; }
+        }
+
+      } else {
+        draw = false;
+        sx = null;
+      }
+    }
+
+    var h = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    h.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    h.onResults(run);
+
+    var cam = new Camera(vid, {
+      onFrame: async () => { await h.send({image: vid}); },
+      width: 1920,
+      height: 1080
+    });
+    cam.start();
+  </script>
+</body>
+</html>
